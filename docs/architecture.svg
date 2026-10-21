@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 580" width="900" height="580" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#1e293b">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- explicit background so the diagram reads the same in light and dark viewers -->
+  <rect width="900" height="580" fill="#ffffff"/>
+
+  <text x="20" y="34" font-size="18" font-weight="bold">Plant Monitor architecture</text>
+
+  <!-- boot -->
+  <rect x="310" y="46" width="280" height="44" rx="6" fill="#f1f5f9" stroke="#475569"/>
+  <text x="450" y="73" text-anchor="middle" font-weight="bold">Boot: one program calls fork()</text>
+
+  <!-- sensors -->
+  <rect x="20" y="150" width="200" height="70" rx="6" fill="#fef9c3" stroke="#a16207"/>
+  <text x="120" y="172" text-anchor="middle" font-weight="bold">BH1750 light sensor</text>
+  <text x="120" y="190" text-anchor="middle">I2C · /dev/i2c-1</text>
+  <text x="120" y="208" text-anchor="middle">daytime only</text>
+
+  <rect x="20" y="340" width="200" height="70" rx="6" fill="#dbeafe" stroke="#1d4ed8"/>
+  <text x="120" y="362" text-anchor="middle" font-weight="bold">Moisture probe + MCP3008</text>
+  <text x="120" y="380" text-anchor="middle">SPI · /dev/spidev0.0</text>
+  <text x="120" y="398" text-anchor="middle">day and night</text>
+
+  <!-- monitors -->
+  <rect x="310" y="130" width="280" height="110" rx="6" fill="#f8fafc" stroke="#475569"/>
+  <text x="450" y="154" text-anchor="middle" font-weight="bold">Parent process: light monitor</text>
+  <text x="450" y="174" text-anchor="middle">single-threaded · timerfd (20 min)</text>
+  <text x="450" y="192" text-anchor="middle">reads sunrise to sunset only</text>
+  <text x="450" y="210" text-anchor="middle">range check · store every reading</text>
+  <text x="450" y="228" text-anchor="middle">notify: too high / too low</text>
+
+  <rect x="310" y="320" width="280" height="110" rx="6" fill="#f8fafc" stroke="#475569"/>
+  <text x="450" y="344" text-anchor="middle" font-weight="bold">Child process: moisture monitor</text>
+  <text x="450" y="364" text-anchor="middle">single-threaded · timerfd (20 min)</text>
+  <text x="450" y="382" text-anchor="middle">reads day and night</text>
+  <text x="450" y="400" text-anchor="middle">range check · store every reading</text>
+  <text x="450" y="418" text-anchor="middle">notify: time to water</text>
+
+  <!-- storage -->
+  <rect x="680" y="130" width="200" height="300" rx="6" fill="#dcfce7" stroke="#15803d"/>
+  <text x="780" y="156" text-anchor="middle" font-weight="bold">Storage layer</text>
+  <text x="780" y="174" text-anchor="middle">(shared code)</text>
+  <text x="780" y="204" text-anchor="middle">one ring file per sensor</text>
+  <text x="780" y="222" text-anchor="middle">30 days × 72 slots</text>
+  <text x="780" y="240" text-anchor="middle">16 B record + CRC</text>
+  <text x="780" y="258" text-anchor="middle">append + fsync per record</text>
+  <text x="780" y="288" text-anchor="middle">kept 30 days, then cleared</text>
+  <text x="780" y="306" text-anchor="middle">or overwritten by new data;</text>
+  <text x="780" y="324" text-anchor="middle">if full, oldest overwritten</text>
+  <text x="780" y="354" text-anchor="middle">reads last 4 records (64 B)</text>
+  <text x="780" y="372" text-anchor="middle">for the range check</text>
+  <text x="780" y="408" text-anchor="middle" font-weight="bold">SD card: ~70 KB fixed</text>
+
+  <!-- notifications -->
+  <rect x="420" y="470" width="460" height="80" rx="6" fill="#fee2e2" stroke="#b91c1c"/>
+  <text x="650" y="494" text-anchor="middle" font-weight="bold">Notification: LAN status page or LED (no internet)</text>
+  <text x="650" y="514" text-anchor="middle">after 5 out-of-range readings in a row, 10 am–6 pm only</text>
+  <text x="650" y="532" text-anchor="middle">at most 1 per sensor per 20 min</text>
+
+  <!-- known gap -->
+  <rect x="20" y="470" width="360" height="80" rx="6" fill="#ffffff" stroke="#64748b" stroke-dasharray="6 4"/>
+  <text x="200" y="494" text-anchor="middle" font-weight="bold">Known gap (planned)</text>
+  <text x="200" y="514" text-anchor="middle">small separate supervisor process</text>
+  <text x="200" y="532" text-anchor="middle">to restart the parent if it crashes</text>
+
+  <!-- arrows -->
+  <g stroke="#475569" stroke-width="1.5" fill="none" marker-end="url(#arrow)">
+    <line x1="450" y1="90" x2="450" y2="128"/>
+    <line x1="220" y1="185" x2="308" y2="185"/>
+    <line x1="220" y1="375" x2="308" y2="375"/>
+    <line x1="420" y1="240" x2="420" y2="318"/>
+    <line x1="520" y1="320" x2="520" y2="242"/>
+    <line x1="590" y1="185" x2="678" y2="185"/>
+    <line x1="590" y1="345" x2="678" y2="345"/>
+    <polyline points="590,225 665,225 665,468"/>
+    <line x1="450" y1="430" x2="450" y2="468"/>
+  </g>
+
+  <!-- arrow labels -->
+  <g font-size="11" fill="#475569">
+    <text x="264" y="178" text-anchor="middle">2 B / 20 min</text>
+    <text x="264" y="368" text-anchor="middle">3 B / 20 min</text>
+    <text x="414" y="276" text-anchor="end">fork() → child</text>
+    <text x="414" y="290" text-anchor="end">(boot, and re-fork)</text>
+    <text x="526" y="276">SIGCHLD:</text>
+    <text x="526" y="290">log, re-fork</text>
+    <text x="626" y="178" text-anchor="middle">16 B + fsync</text>
+    <text x="626" y="338" text-anchor="middle">16 B + fsync</text>
+  </g>
+</svg>
