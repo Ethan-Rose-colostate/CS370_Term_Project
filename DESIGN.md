@@ -2,13 +2,13 @@
 
 ![Architecture](docs/architecture.svg)
 
-At boot the program calls `fork()`: the parent process becomes the light monitor and the child process becomes the moisture monitor, each single-threaded and sleeping on a 20-minute timer (`timerfd`). When the child's timer fires, it reads the moisture probe over SPI through an MCP3008 ADC (`/dev/spidev0.0`), day or night. If the reading is in the expected range, or out of range while any of the previous 4 readings were in range (treated as a one-off), it is stored. If it is the 5th out-of-range reading in a row and the time is between 10 am and 6 pm, the child also sends a "time to water" notification to the LAN status page or an LED, never the internet. In every case the value and its time are stored.
+At boot the program calls `fork()`: the parent process becomes the light monitor and the child process becomes the moisture monitor, each single-threaded and sleeping on a 20-minute timer (`timerfd`). When the child's timer fires, it reads the moisture probe over SPI through an MCP3008 ADC (`/dev/spidev0.0`), day or night. If the reading is in the expected range, or out of range while either of the previous 2 readings was in range (treated as a one-off), it is stored. If it is the 3rd out-of-range reading in a row and the time is between 10 am and 6 pm, the child also sends a "time to water" notification to the LAN status page or an LED, never the internet. In every case the value and its time are stored.
 
 | Component | Job | Menu mechanism |
 |---|---|---|
-| Parent (light monitor) | Reads light over I2C (BH1750, `/dev/i2c-1`) every 20 min during daytime only: between expected sunrise and sunset for the configured time zone, hemisphere, and season (the date may need to be supplied at startup); applies the range / one-off / 5-in-a-row check and notifies "too high" or "too low" 10 am–6 pm; on `SIGCHLD` logs it and re-forks the child | E |
+| Parent (light monitor) | Reads light over I2C (BH1750, `/dev/i2c-1`) every 20 min during daytime only: between expected sunrise and sunset for the configured time zone, hemisphere, and season (the date may need to be supplied at startup); applies the range / one-off / 3-in-a-row check and notifies "too high" or "too low" 10 am–6 pm; on `SIGCHLD` logs it and re-forks the child | E |
 | Child (moisture monitor) | Reads moisture over SPI (MCP3008, `/dev/spidev0.0`), day and night, every 20 min; same check, notifies "time to water" 10 am–6 pm | E (isolated, so a water-damaged sensor can't stop light monitoring) |
-| Storage layer (shared code) | One fixed-size ring file per sensor (30 days × 72 slots, 16 B records + CRC); a record is kept for 30 days, then overwritten by waiting data or, if none is waiting, cleared and marked free; if a record must be stored and no slot is free, the oldest is overwritten; append + `fsync` per record; reads the last 4 records for the check | D |
+| Storage layer (shared code) | One fixed-size ring file per sensor (30 days × 72 slots, 16 B records + CRC); a record is kept for 30 days, then overwritten by waiting data or, if none is waiting, cleared and marked free; if a record must be stored and no slot is free, the oldest is overwritten; append + `fsync` per record; reads the last 2 records for the check | D |
 
 ### Data-flow rates
 
@@ -16,7 +16,7 @@ At boot the program calls `fork()`: the parent process becomes the light monitor
 |---|---|
 | Sensor reads | Moisture: 1 per 20 min, day and night (72/day, 3 B each). Light: 1 per 20 min, sunrise to sunset only (3 per daylight hour, 2 B each) |
 | Storage writes | 1 record (16 B, `fsync` each) per sensor read: moisture 72/day; light 3 per daylight hour |
-| Storage reads | Last 4 records (64 B), only when a reading is out of range |
+| Storage reads | Last 2 records (32 B), only when a reading is out of range |
 | SD card writes | Moisture 1,152 B/day + light 48 B per daylight hour (e.g. 12 h of daylight → 576 B, ~1.7 KB/day total) |
 | SD card footprint | ~70 KB total, fixed (2 rings × 2,160 slots × 16 B) |
 | Notifications | At most 1 per sensor per 20 min, 10 am–6 pm only (light only while it is daytime) |
@@ -30,7 +30,7 @@ D: Custom storage layer
 
 Component: the shared storage layer used by both processes. It keeps one fixed-size ring file per sensor (30 days × 72 slots), with 16-byte records that each carry a CRC, and it fsyncs after every record.
 
-Justification: Our alert rule only fires after five out-of-range readings in a row, so every decision depends on the last four stored readings being present and correct. A device sitting on a windowsill gets bumped, unplugged, and power-cycled. If a power cut lost the history, a dry plant’s alert would be delayed by another 100 minutes. If it left a half-written record that read back as valid, it could send a false “water now,” and a plant owner who waters on a false alarm is overwatering, the exact failure we exist to prevent. That rules out a plain append file, hence a crash-consistent log with a CRC on every record and an fsync after each write. Because the device runs unattended for months, the file is a fixed-size ring: a record is kept for 30 days, then overwritten by waiting data or, if none is waiting, cleared and marked free; if a record must be stored and no slot is free, the oldest is overwritten, so the SD card can never fill.
+Justification: Our alert rule only fires after three out-of-range readings in a row, so every decision depends on the last two stored readings being present and correct. A device sitting on a windowsill gets bumped, unplugged, and power-cycled. If a power cut lost the history, a dry plant’s alert would be delayed by up to another hour. If it left a half-written record that read back as valid, it could send a false “water now,” and a plant owner who waters on a false alarm is overwatering, the exact failure we exist to prevent. That rules out a plain append file, hence a crash-consistent log with a CRC on every record and an fsync after each write. Because the device runs unattended for months, the file is a fixed-size ring: a record is kept for 30 days, then overwritten by waiting data or, if none is waiting, cleared and marked free; if a record must be stored and no slot is free, the oldest is overwritten, so the SD card can never fill.
 
 E: Multi-process architecture with restart
 
@@ -58,24 +58,11 @@ Known gap: if the parent itself crashes, nothing restarts it. A small separate s
 
 **Rate:** moisture 1 record every 20 min, day and night (72/day). Light 1 record every 20 min during daylight only (3 per daylight hour). About 1.7 KB/day total.
 
-**Format:** fixed-size 16-byte binary records holding the reading, its timestamp, a fault flag, and a CRC.
+**Format:** fixed-size 16-byte binary records: sequence number (4 B), timestamp (4 B), reading (2 B), fault flag (1 B), unused (1 B), CRC32 (4 B).
 
 **Retention:** 30 days (72 slots × 30 days per sensor, about 70 KB total, fixed). A record is kept for 30 days, then overwritten by waiting data or, if none is waiting, cleared and marked free; if a record must be stored and no slot is free, the oldest is overwritten. The SD card can never fill.
 
 **Power loss mid-write:** each record is `fsync`ed as soon as it is written. On boot, every record's CRC is checked, and any record with a bad CRC is treated as empty. At most the one record being written when power died is lost.
-
-## Constraints and substitutions
-
-| Ideal | What we're using | What the gap costs |
-|---|---|---|
-| PAR (quantum) light sensor, about $300, measures the light plants actually use | BH1750 lux sensor, about $3 | Lux measures light the way human eyes see it, not plants. We only claim "brighter or darker than the expected range," not exact plant light |
-| Calibrated soil moisture sensor, $100+ | Capacitive probe + MCP3008 ADC, about $8 | Readings are relative and change with soil type and pot. We compare against an expected range, not an absolute moisture level |
-| Battery-backed clock (RTC) | No clock battery; time is corrected from the owner's phone | After a power cut, timestamps are wrong until the phone connects, then they are re-stamped |
-| Push notifications to the owner's phone from anywhere | LAN status page or an LED on the device | The owner only sees alerts when at home or on the same network |
-| Waterproof enclosure | Electronics kept above the soil line | Water can still reach the electronics; probe failures are handled in the failure-mode table |
-| Months of real dry-out cycles to test with | A few real cycles, plus recorded data replayed faster | Replayed data is labeled as replayed in logs, the report, and the demo. The 48-hour soak and the demo use live sensors |
-
-**Narrowed claim:** for one plant in one pot, the device alerts when moisture or light has been out of the expected range for 3 readings in a row (40 minutes), between 10 am and 6 pm.
 
 ## Constraints and substitutions
 
