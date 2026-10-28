@@ -20,8 +20,6 @@ logged. The 48-hour soak is the test suite of last resort.
 | Evan | Moisture monitor (child process), storage layer (D), moisture probe and ADC wiring |
 | Shared | Notifications and status page, evaluation runs |
 
-- Shared: supervisor, interface. The agent edits outside the current
-session owner’s area only when told explicitly whose session this is.
 ## Style
 - Systems core: C17, -Wall -Wextra -Werror, no VLAs.
 goto-cleanup for multi-resource functions.
