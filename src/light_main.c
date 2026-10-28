@@ -1,6 +1,8 @@
 /*
- * Light monitor: reads lux from a BH1750 on /dev/i2c-1 every interval and
- * stores each reading in the light ring file.
+ * Light monitor: reads the digital output (DO) of a photoresistor module on
+ * GPIO17 every interval and stores each reading in the light ring file.
+ * Reading 1 = brighter than the module's threshold (set by its trimmer),
+ * 0 = darker.
  *
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on fatal error, 2 on bad usage.
  */
@@ -13,22 +15,20 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <linux/i2c-dev.h>
+#include <linux/gpio.h>
 
 #include "log.h"
 #include "store/ring.h"
 
-#define I2C_DEV			"/dev/i2c-1"
-#define BH1750_ADDR		0x23
-#define BH1750_POWER_ON		0x01
-#define BH1750_ONE_TIME_HRES	0x20	/* measure once, then power down */
-#define BH1750_MEAS_MS		180	/* max high-res measurement time */
+#define GPIO_CHIP		"/dev/gpiochip0"
+#define LIGHT_GPIO		17	/* BCM numbering: header pin 11 */
 #define READ_ATTEMPTS		3
 #define RETRY_MS		100
 #define DEFAULT_INTERVAL_S	1200
@@ -97,57 +97,44 @@ static uint32_t now_unix(void)
 	return (uint32_t)ts.tv_sec;
 }
 
+/* Request GPIO17 as an input; returns the line fd or -1. */
 static int bus_open(void)
 {
-	int fd = open(I2C_DEV, O_RDWR | O_CLOEXEC);
+	struct gpio_v2_line_request req;
+	int chip = open(GPIO_CHIP, O_RDONLY | O_CLOEXEC);
 	int err;
 
-	if (fd < 0) {
-		log_msg(L_WARN, "light", "open %s failed (errno=%d)", I2C_DEV, errno);
+	if (chip < 0) {
+		log_msg(L_WARN, "light", "open %s failed (errno=%d)", GPIO_CHIP, errno);
 		return -1;
 	}
-	if (ioctl(fd, I2C_SLAVE, BH1750_ADDR) < 0) {
+	memset(&req, 0, sizeof req);
+	req.offsets[0] = LIGHT_GPIO;
+	req.num_lines = 1;
+	req.config.flags = GPIO_V2_LINE_FLAG_INPUT;
+	strncpy(req.consumer, "light_monitor", sizeof req.consumer - 1);
+	if (ioctl(chip, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
 		err = errno;
-		log_msg(L_WARN, "light", "ioctl I2C_SLAVE 0x%02x failed (errno=%d)",
-			BH1750_ADDR, err);
-		close_fd(&fd, I2C_DEV);
+		log_msg(L_WARN, "light", "request GPIO%d failed (errno=%d)",
+			LIGHT_GPIO, err);
+		close_fd(&chip, GPIO_CHIP);
 		errno = err;
 		return -1;
 	}
-	return fd;
+	close_fd(&chip, GPIO_CHIP);
+	return req.fd;
 }
 
-static int bh1750_cmd(int fd, uint8_t cmd)
+/* The module pulls DO low when it is brighter than its threshold. */
+static int light_measure(int fd, uint16_t *bright)
 {
-	ssize_t n = write(fd, &cmd, 1);
+	struct gpio_v2_line_values vals = { .mask = 1 };
 
-	if (n == 1)
-		return 0;
-	if (n >= 0)
-		errno = EIO;
-	log_msg(L_WARN, "light", "i2c write 0x%02x failed (errno=%d)", cmd, errno);
-	return -1;
-}
-
-static int bh1750_measure(int fd, uint16_t *lux)
-{
-	uint8_t buf[2];
-	uint32_t raw;
-	ssize_t n;
-
-	if (bh1750_cmd(fd, BH1750_POWER_ON) < 0 ||
-	    bh1750_cmd(fd, BH1750_ONE_TIME_HRES) < 0)
-		return -1;
-	sleep_ms(BH1750_MEAS_MS);
-	n = read(fd, buf, sizeof buf);
-	if (n != (ssize_t)sizeof buf) {
-		if (n >= 0)
-			errno = EIO;
-		log_msg(L_WARN, "light", "i2c read failed (errno=%d)", errno);
+	if (ioctl(fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &vals) < 0) {
+		log_msg(L_WARN, "light", "gpio read failed (errno=%d)", errno);
 		return -1;
 	}
-	raw = (uint32_t)buf[0] << 8 | buf[1];
-	*lux = (uint16_t)((raw * 5 + 3) / 6);	/* lux = raw / 1.2, rounded */
+	*bright = (vals.bits & 1) ? 0 : 1;
 	return 0;
 }
 
@@ -161,12 +148,12 @@ static int read_light(int *bus, uint16_t *lux)
 			sleep_ms(RETRY_MS);
 		if (*bus < 0)
 			*bus = bus_open();
-		if (*bus >= 0 && bh1750_measure(*bus, lux) == 0)
+		if (*bus >= 0 && light_measure(*bus, lux) == 0)
 			return 0;
 		err = errno;
-		close_fd(bus, I2C_DEV);
+		close_fd(bus, GPIO_CHIP);
 	}
-	log_msg(L_WARN, "light", "i2c read failed x%d (errno=%d), skipped",
+	log_msg(L_WARN, "light", "gpio read failed x%d (errno=%d), skipped",
 		READ_ATTEMPTS, err);
 	return -1;
 }
@@ -185,11 +172,11 @@ static void take_reading(struct ring *ring, int *bus, struct stats *st)
 	st->readings++;
 	if (ring_append(ring, ts, lux, fault) < 0) {
 		st->store_errors++;
-		log_msg(L_WARN, "light", "reading not stored (lux=%u fault=%u)",
+		log_msg(L_WARN, "light", "reading not stored (bright=%u fault=%u)",
 			(unsigned)lux, (unsigned)fault);
 		return;
 	}
-	log_msg(L_INFO, "light", "lux=%u fault=%u", (unsigned)lux, (unsigned)fault);
+	log_msg(L_INFO, "light", "bright=%u fault=%u", (unsigned)lux, (unsigned)fault);
 }
 
 static int make_timer(long secs, const char *what)
@@ -349,7 +336,7 @@ int main(int argc, char **argv)
 out:
 	close_fd(&hb_fd, "heartbeat timer");
 	close_fd(&tick_fd, "read timer");
-	close_fd(&bus, I2C_DEV);
+	close_fd(&bus, GPIO_CHIP);
 	close_fd(&sig_fd, "signalfd");
 	if (ring_close(ring) < 0)
 		ret = 1;
