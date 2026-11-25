@@ -51,6 +51,7 @@
 #ifndef DAY_END_H
 #define DAY_END_H		18
 #endif
+#define DARK_RUN		3	/* dark readings in a row = too dark */
 #define BACKOFF_MAX_S		60
 #define BACKOFF_RESET_S		600	/* child uptime that resets the backoff */
 
@@ -184,6 +185,20 @@ static int read_light(int *bus, uint16_t *lux)
 {
 	int err = 0;
 
+#ifdef LIGHT_TEST_SCRIPT
+	/* Test builds only: replay a fixed pattern (B=bright, D=dark, F=fault). */
+	static const char script[] = LIGHT_TEST_SCRIPT;
+	static size_t next;
+	char c = script[next++ % (sizeof script - 1)];
+
+	(void)bus;
+	(void)err;
+	if (c == 'F')
+		return -1;
+	*lux = c == 'B';
+	return 0;
+#endif
+
 	for (int attempt = 1; attempt <= READ_ATTEMPTS; attempt++) {
 		if (attempt > 1)
 			sleep_ms(RETRY_MS);
@@ -199,7 +214,9 @@ static int read_light(int *bus, uint16_t *lux)
 	return -1;
 }
 
-static void take_reading(struct ring *ring, int *bus, struct stats *st)
+/* Read, store and log one reading into *rec. Returns 0 if it was stored. */
+static int take_reading(struct ring *ring, int *bus, struct stats *st,
+			struct ring_record *rec)
 {
 	uint32_t ts = now_unix();
 	uint16_t lux = 0;
@@ -210,14 +227,16 @@ static void take_reading(struct ring *ring, int *bus, struct stats *st)
 		fault = 1;
 		st->faults++;
 	}
+	*rec = (struct ring_record){ .ts = ts, .reading = lux, .fault = fault };
 	st->readings++;
 	if (ring_append(ring, ts, lux, fault) < 0) {
 		st->store_errors++;
 		log_msg(L_WARN, "light", "reading not stored (bright=%u fault=%u)",
 			(unsigned)lux, (unsigned)fault);
-		return;
+		return -1;
 	}
 	log_msg(L_INFO, "light", "bright=%u fault=%u", (unsigned)lux, (unsigned)fault);
+	return 0;
 }
 
 /* Local hour 0..23, or -1 if the clock can't be read. */
@@ -249,6 +268,82 @@ static int daytime(struct light_state *ls)
 			in ? "resumed" : "paused");
 	}
 	return in;
+}
+
+/* Unix time of today's DAY_START_H:00 local, or 0 if it can't be computed. */
+static uint32_t day_start_unix(void)
+{
+	time_t now = time(NULL), t;
+	struct tm tm;
+
+	if (now == (time_t)-1 || !localtime_r(&now, &tm)) {
+		log_msg(L_WARN, "light", "local time unavailable (errno=%d)", errno);
+		return 0;
+	}
+	tm.tm_hour = DAY_START_H;
+	tm.tm_min = 0;
+	tm.tm_sec = 0;
+	tm.tm_isdst = -1;
+	t = mktime(&tm);
+	if (t == (time_t)-1 || t < 0 || (uint64_t)t > UINT32_MAX) {
+		log_msg(L_WARN, "light", "mktime for day start failed");
+		return 0;
+	}
+	return (uint32_t)t;
+}
+
+static struct ring_record ring_scratch[RING_SLOTS];	/* for ring_read_all() */
+
+/*
+ * Called on a dark, non-fault reading. True if it and the stored readings
+ * before it make DARK_RUN dark, non-fault readings in a row, all from today's
+ * window. A stored reading is the newest record itself; if it couldn't be
+ * stored, the DARK_RUN - 1 newest records are checked alongside it.
+ */
+static int too_dark(const char *path, int stored)
+{
+	const struct ring_record *top[DARK_RUN] = { NULL };
+	size_t need = stored ? DARK_RUN : DARK_RUN - 1;
+	uint32_t since = day_start_unix();
+	size_t n, bad;
+
+	if (ring_read_all(path, ring_scratch, &n, &bad) < 0)
+		return 0;	/* logged by the store */
+	/* Keep the `need` highest sequence numbers, newest first. */
+	for (size_t i = 0; i < n; i++) {
+		const struct ring_record *r = &ring_scratch[i];
+		size_t k = 0;
+
+		while (k < need && top[k] && top[k]->seq > r->seq)
+			k++;
+		if (k == need)
+			continue;
+		for (size_t j = need - 1; j > k; j--)
+			top[j] = top[j - 1];
+		top[k] = r;
+	}
+	for (size_t k = 0; k < need; k++) {
+		if (!top[k] || top[k]->fault || top[k]->reading || top[k]->ts < since)
+			return 0;
+	}
+	return 1;
+}
+
+/* One read tick: daytime check, the reading, then the light rules. */
+static void light_tick(struct ring *ring, const char *path, int *bus,
+		       struct stats *st, struct light_state *ls)
+{
+	struct ring_record rec;
+	int stored;
+
+	if (!daytime(ls))
+		return;
+	stored = take_reading(ring, bus, st, &rec) == 0;
+	if (rec.fault || rec.reading)
+		return;
+	if (too_dark(path, stored))
+		log_msg(L_WARN, "light", "too dark (%d dark readings in a row)",
+			DARK_RUN);
 }
 
 static int make_timer(long secs, const char *what)
@@ -599,8 +694,7 @@ int main(int argc, char **argv)
 
 	log_msg(L_INFO, "light", "heartbeat: started, interval %lds, ring %s",
 		interval, path);
-	if (daytime(&ls))
-		take_reading(ring, &bus, &st);
+	light_tick(ring, path, &bus, &st, &ls);
 
 	for (;;) {
 		struct pollfd pfd[4] = {
@@ -649,8 +743,7 @@ int main(int argc, char **argv)
 			if (exp > 1)
 				log_msg(L_WARN, "light", "missed %llu read ticks",
 					(unsigned long long)(exp - 1));
-			if (daytime(&ls))
-				take_reading(ring, &bus, &st);
+			light_tick(ring, path, &bus, &st, &ls);
 		}
 		if (pfd[2].revents & POLLIN) {
 			if (read_timer(hb_fd, "heartbeat", &exp) < 0)
