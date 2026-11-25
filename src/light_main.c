@@ -4,6 +4,9 @@
  * Reading 1 = brighter than the module's threshold (set by its trimmer),
  * 0 = darker.
  *
+ * It is also the parent process: at startup it forks and execs the moisture
+ * monitor with the same interval, and on shutdown it SIGTERMs and reaps it.
+ *
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on fatal error, 2 on bad usage.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -19,6 +22,8 @@
 #include <sys/ioctl.h>
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,6 +39,7 @@
 #define DEFAULT_INTERVAL_S	1200
 #define HEARTBEAT_S		3600
 #define DEFAULT_RING		"data/light.ring"
+#define DEFAULT_MOISTURE	"build/moisture"
 
 struct stats {
 	unsigned long readings;
@@ -43,10 +49,12 @@ struct stats {
 
 static void usage(FILE *f, const char *prog)
 {
-	fprintf(f, "usage: %s [-i seconds] [-f ringfile]\n"
+	fprintf(f, "usage: %s [-i seconds] [-f ringfile] [-m moisture]\n"
 		"  -i  read interval, 1..%d seconds (default %d)\n"
-		"  -f  ring file (default %s)\n",
-		prog, DEFAULT_INTERVAL_S, DEFAULT_INTERVAL_S, DEFAULT_RING);
+		"  -f  ring file (default %s)\n"
+		"  -m  moisture program to run as child (default %s)\n",
+		prog, DEFAULT_INTERVAL_S, DEFAULT_INTERVAL_S, DEFAULT_RING,
+		DEFAULT_MOISTURE);
 }
 
 static int parse_interval(const char *s, long *out)
@@ -216,18 +224,92 @@ static int read_timer(int fd, const char *what, uint64_t *expirations)
 	return 0;
 }
 
+/*
+ * Fork and exec the moisture monitor with the same interval. The caller has
+ * SIGTERM/SIGINT blocked for its signalfd; the child unblocks them before exec
+ * so the moisture program starts with a clean mask. Returns the pid or -1.
+ */
+static pid_t start_child(const char *prog, long interval, const sigset_t *mask)
+{
+	char ival[24];
+	char *args[4];
+	pid_t pid;
+	int n;
+
+	n = snprintf(ival, sizeof ival, "%ld", interval);
+	if (n < 0 || (size_t)n >= sizeof ival) {
+		log_msg(L_ERROR, "parent", "interval format failed");
+		return -1;
+	}
+	args[0] = (char *)prog;
+	args[1] = "-i";
+	args[2] = ival;
+	args[3] = NULL;
+
+	/* Don't let buffered stdio get written twice. */
+	if (fflush(NULL) == EOF)
+		log_msg(L_WARN, "parent", "fflush failed (errno=%d)", errno);
+
+	pid = fork();
+	if (pid < 0) {
+		log_msg(L_ERROR, "parent", "fork failed (errno=%d)", errno);
+		return -1;
+	}
+	if (pid == 0) {
+		if (sigprocmask(SIG_UNBLOCK, mask, NULL) < 0) {
+			log_msg(L_ERROR, "child", "sigprocmask unblock failed (errno=%d)",
+				errno);
+			_exit(1);
+		}
+		execv(prog, args);
+		log_msg(L_ERROR, "child", "exec %s failed (errno=%d)", prog, errno);
+		_exit(1);
+	}
+	log_msg(L_INFO, "parent", "started moisture child pid %ld", (long)pid);
+	return pid;
+}
+
+/* SIGTERM the child and reap it so nothing outlives the parent. */
+static void stop_child(pid_t pid)
+{
+	int status;
+	pid_t r;
+
+	if (pid <= 0)
+		return;
+	if (kill(pid, SIGTERM) < 0)
+		log_msg(L_WARN, "parent", "kill child pid %ld failed (errno=%d)",
+			(long)pid, errno);
+	do
+		r = waitpid(pid, &status, 0);
+	while (r < 0 && errno == EINTR);
+	if (r < 0) {
+		log_msg(L_ERROR, "parent", "waitpid child pid %ld failed (errno=%d)",
+			(long)pid, errno);
+		return;
+	}
+	if (WIFEXITED(status))
+		log_msg(L_INFO, "parent", "child pid %ld exited with status %d",
+			(long)pid, WEXITSTATUS(status));
+	else if (WIFSIGNALED(status))
+		log_msg(L_INFO, "parent", "child pid %ld killed by signal %d",
+			(long)pid, WTERMSIG(status));
+}
+
 int main(int argc, char **argv)
 {
 	const char *path = DEFAULT_RING;
+	const char *moisture = DEFAULT_MOISTURE;
 	long interval = DEFAULT_INTERVAL_S;
 	struct ring *ring = NULL;
 	struct stats st = { 0 };
 	int bus = -1, sig_fd = -1, tick_fd = -1, hb_fd = -1;
 	int ret = 1;
+	pid_t child = -1;
 	sigset_t mask;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "i:f:h")) != -1) {
+	while ((opt = getopt(argc, argv, "i:f:m:h")) != -1) {
 		switch (opt) {
 		case 'i':
 			if (parse_interval(optarg, &interval) < 0) {
@@ -238,6 +320,9 @@ int main(int argc, char **argv)
 			break;
 		case 'f':
 			path = optarg;
+			break;
+		case 'm':
+			moisture = optarg;
 			break;
 		case 'h':
 			usage(stdout, argv[0]);
@@ -267,6 +352,11 @@ int main(int argc, char **argv)
 		log_msg(L_ERROR, "light", "signalfd failed (errno=%d)", errno);
 		goto out;
 	}
+
+	/* Fork before opening the ring, timers and bus so the child inherits none. */
+	child = start_child(moisture, interval, &mask);
+	if (child < 0)
+		goto out;
 
 	if (ring_open(path, &ring) < 0)
 		goto out;
@@ -334,6 +424,7 @@ int main(int argc, char **argv)
 	}
 
 out:
+	stop_child(child);
 	close_fd(&hb_fd, "heartbeat timer");
 	close_fd(&tick_fd, "read timer");
 	close_fd(&bus, GPIO_CHIP);
