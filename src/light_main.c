@@ -55,6 +55,7 @@
 #define NOTIFY_START_H		10
 #endif
 #define DARK_RUN		3	/* dark readings in a row = too dark */
+#define FAULT_RUN		3	/* fault readings in a row = sensor fault */
 #define BACKOFF_MAX_S		60
 #define BACKOFF_RESET_S		600	/* child uptime that resets the backoff */
 
@@ -70,6 +71,8 @@ struct stats {
 struct light_state {
 	int paused;		/* outside the daytime window */
 	int notified;		/* too-dark notification sent for this dark streak */
+	unsigned fault_run;	/* fault readings in a row, capped at FAULT_RUN */
+	int sensor_fault;	/* "sensor fault" logged, waiting for a good reading */
 };
 
 /* The moisture child and its restart policy. */
@@ -350,8 +353,19 @@ static void light_tick(struct ring *ring, const char *path, int *bus,
 	if (!daytime(ls))
 		return;
 	stored = take_reading(ring, bus, st, &rec) == 0;
-	if (rec.fault)
+	if (rec.fault) {
+		if (ls->fault_run < FAULT_RUN && ++ls->fault_run == FAULT_RUN &&
+		    !ls->sensor_fault) {
+			log_msg(L_WARN, "light", "sensor fault");
+			ls->sensor_fault = 1;
+		}
 		return;
+	}
+	ls->fault_run = 0;
+	if (ls->sensor_fault) {
+		log_msg(L_INFO, "light", "sensor recovered");
+		ls->sensor_fault = 0;
+	}
 	if (rec.reading) {
 		ls->notified = 0;	/* a bright reading ends the dark streak */
 		return;
