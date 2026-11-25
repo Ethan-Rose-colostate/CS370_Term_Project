@@ -51,6 +51,9 @@
 #ifndef DAY_END_H
 #define DAY_END_H		18
 #endif
+#ifndef NOTIFY_START_H			/* too-dark notifications from here to DAY_END_H */
+#define NOTIFY_START_H		10
+#endif
 #define DARK_RUN		3	/* dark readings in a row = too dark */
 #define BACKOFF_MAX_S		60
 #define BACKOFF_RESET_S		600	/* child uptime that resets the backoff */
@@ -66,6 +69,7 @@ struct stats {
 /* Light decision state carried between readings. */
 struct light_state {
 	int paused;		/* outside the daytime window */
+	int notified;		/* too-dark notification sent for this dark streak */
 };
 
 /* The moisture child and its restart policy. */
@@ -263,6 +267,7 @@ static int daytime(struct light_state *ls)
 
 	if (ls->paused == in) {
 		ls->paused = !in;
+		ls->notified = 0;	/* each day starts a new dark streak */
 		log_msg(L_INFO, "light", "%s %02d:00-%02d:00, readings %s",
 			in ? "inside" : "outside", DAY_START_H, DAY_END_H,
 			in ? "resumed" : "paused");
@@ -329,21 +334,36 @@ static int too_dark(const char *path, int stored)
 	return 1;
 }
 
+/* Stub: the status page will hook in here. */
+static void notify(const char *what)
+{
+	log_msg(L_INFO, "NOTIFY light", "%s", what);
+}
+
 /* One read tick: daytime check, the reading, then the light rules. */
 static void light_tick(struct ring *ring, const char *path, int *bus,
 		       struct stats *st, struct light_state *ls)
 {
 	struct ring_record rec;
-	int stored;
+	int stored, h;
 
 	if (!daytime(ls))
 		return;
 	stored = take_reading(ring, bus, st, &rec) == 0;
-	if (rec.fault || rec.reading)
+	if (rec.fault)
 		return;
-	if (too_dark(path, stored))
-		log_msg(L_WARN, "light", "too dark (%d dark readings in a row)",
-			DARK_RUN);
+	if (rec.reading) {
+		ls->notified = 0;	/* a bright reading ends the dark streak */
+		return;
+	}
+	if (!too_dark(path, stored))
+		return;
+	log_msg(L_WARN, "light", "too dark (%d dark readings in a row)", DARK_RUN);
+	h = local_hour();
+	if (!ls->notified && (h < 0 || (h >= NOTIFY_START_H && h < DAY_END_H))) {
+		notify("too dark");
+		ls->notified = 1;
+	}
 }
 
 static int make_timer(long secs, const char *what)
