@@ -5,7 +5,8 @@
  * 0 = darker.
  *
  * It is also the parent process: at startup it forks and execs the moisture
- * monitor with the same interval, and on shutdown it SIGTERMs and reaps it.
+ * monitor with the same interval, re-forks it with backoff if it dies, and on
+ * shutdown it SIGTERMs and reaps it.
  *
  * Exit codes: 0 on SIGTERM/SIGINT, 1 on fatal error, 2 on bad usage.
  */
@@ -13,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -40,6 +42,10 @@
 #define HEARTBEAT_S		3600
 #define DEFAULT_RING		"data/light.ring"
 #define DEFAULT_MOISTURE	"build/moisture"
+#define BACKOFF_MAX_S		60
+#define BACKOFF_RESET_S		600	/* child uptime that resets the backoff */
+
+enum { OPT_NO_RESTART = 256 };
 
 struct stats {
 	unsigned long readings;
@@ -47,12 +53,25 @@ struct stats {
 	unsigned long store_errors;
 };
 
+/* The moisture child and its restart policy. */
+struct child_sup {
+	const char *prog;
+	long interval;
+	const sigset_t *mask;
+	int restart;		/* 0 with --no-restart */
+	pid_t pid;		/* -1 while down */
+	time_t started;		/* CLOCK_MONOTONIC seconds, -1 if unknown */
+	long delay_s;		/* next backoff */
+	unsigned long restarts;
+};
+
 static void usage(FILE *f, const char *prog)
 {
-	fprintf(f, "usage: %s [-i seconds] [-f ringfile] [-m moisture]\n"
+	fprintf(f, "usage: %s [-i seconds] [-f ringfile] [-m moisture] [--no-restart]\n"
 		"  -i  read interval, 1..%d seconds (default %d)\n"
 		"  -f  ring file (default %s)\n"
-		"  -m  moisture program to run as child (default %s)\n",
+		"  -m  moisture program to run as child (default %s)\n"
+		"  --no-restart  leave the child dead if it exits\n",
 		prog, DEFAULT_INTERVAL_S, DEFAULT_INTERVAL_S, DEFAULT_RING,
 		DEFAULT_MOISTURE);
 }
@@ -226,8 +245,9 @@ static int read_timer(int fd, const char *what, uint64_t *expirations)
 
 /*
  * Fork and exec the moisture monitor with the same interval. The caller has
- * SIGTERM/SIGINT blocked for its signalfd; the child unblocks them before exec
- * so the moisture program starts with a clean mask. Returns the pid or -1.
+ * SIGTERM/SIGINT/SIGCHLD blocked for its signalfd; the child unblocks them
+ * before exec so the moisture program starts with a clean mask. Returns the
+ * pid or -1.
  */
 static pid_t start_child(const char *prog, long interval, const sigset_t *mask)
 {
@@ -296,20 +316,120 @@ static void stop_child(pid_t pid)
 			(long)pid, WTERMSIG(status));
 }
 
+static time_t mono_now(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+		log_msg(L_WARN, "parent", "clock_gettime failed (errno=%d)", errno);
+		return -1;
+	}
+	return ts.tv_sec;
+}
+
+/* Start the child and note when, for the backoff reset. */
+static void spawn_child(struct child_sup *cs)
+{
+	cs->pid = start_child(cs->prog, cs->interval, cs->mask);
+	cs->started = cs->pid > 0 ? mono_now() : -1;
+}
+
+/* Arm the one-shot restart timer for the next backoff step. */
+static int schedule_refork(struct child_sup *cs, int fd, unsigned long *n, long *secs)
+{
+	struct itimerspec its = { .it_value = { .tv_sec = cs->delay_s } };
+
+	if (timerfd_settime(fd, 0, &its, NULL) < 0) {
+		log_msg(L_ERROR, "parent", "timerfd_settime restart failed (errno=%d)",
+			errno);
+		return -1;
+	}
+	*n = ++cs->restarts;
+	*secs = cs->delay_s;
+	cs->delay_s = cs->delay_s * 2 > BACKOFF_MAX_S ? BACKOFF_MAX_S : cs->delay_s * 2;
+	return 0;
+}
+
+/* Reap a dead child and schedule its re-fork. Returns -1 on fatal error. */
+static int on_sigchld(struct child_sup *cs, int restart_fd)
+{
+	char why[32];
+	unsigned long n;
+	long secs;
+	time_t now;
+	int status;
+	pid_t dead = cs->pid, r;
+
+	if (dead <= 0)
+		return 0;
+	do
+		r = waitpid(dead, &status, WNOHANG);
+	while (r < 0 && errno == EINTR);
+	if (r == 0)
+		return 0;	/* stopped or continued, not dead */
+	if (r < 0) {
+		log_msg(L_ERROR, "parent", "waitpid child pid %ld failed (errno=%d)",
+			(long)dead, errno);
+		snprintf(why, sizeof why, "status unknown");
+	} else if (WIFEXITED(status)) {
+		snprintf(why, sizeof why, "exit %d", WEXITSTATUS(status));
+	} else if (WIFSIGNALED(status)) {
+		snprintf(why, sizeof why, "signal %d", WTERMSIG(status));
+	} else {
+		snprintf(why, sizeof why, "status 0x%x", (unsigned)status);
+	}
+	cs->pid = -1;
+
+	if (!cs->restart) {
+		log_msg(L_ERROR, "parent", "child pid %ld died (%s), not restarting",
+			(long)dead, why);
+		return 0;
+	}
+	now = mono_now();
+	if (cs->started >= 0 && now >= 0 && now - cs->started >= BACKOFF_RESET_S)
+		cs->delay_s = 1;
+	if (schedule_refork(cs, restart_fd, &n, &secs) < 0)
+		return -1;
+	log_msg(L_ERROR, "parent", "child pid %ld died (%s), re-fork #%lu in %ld s",
+		(long)dead, why, n, secs);
+	return 0;
+}
+
+/* Restart timer fired: re-fork, or back off again if the fork fails. */
+static int on_restart_timer(struct child_sup *cs, int restart_fd)
+{
+	unsigned long n;
+	long secs;
+
+	spawn_child(cs);
+	if (cs->pid > 0)
+		return 0;
+	if (schedule_refork(cs, restart_fd, &n, &secs) < 0)
+		return -1;
+	log_msg(L_ERROR, "parent", "re-fork failed, re-fork #%lu in %ld s", n, secs);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	static const struct option longopts[] = {
+		{ "no-restart", no_argument, NULL, OPT_NO_RESTART },
+		{ NULL, 0, NULL, 0 },
+	};
 	const char *path = DEFAULT_RING;
-	const char *moisture = DEFAULT_MOISTURE;
 	long interval = DEFAULT_INTERVAL_S;
 	struct ring *ring = NULL;
 	struct stats st = { 0 };
-	int bus = -1, sig_fd = -1, tick_fd = -1, hb_fd = -1;
+	struct child_sup cs = {
+		.prog = DEFAULT_MOISTURE, .restart = 1, .pid = -1,
+		.started = -1, .delay_s = 1,
+	};
+	int bus = -1, sig_fd = -1, tick_fd = -1, hb_fd = -1, restart_fd = -1;
 	int ret = 1;
-	pid_t child = -1;
 	sigset_t mask;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "i:f:m:h")) != -1) {
+	while ((opt = getopt_long(argc, argv, "i:f:m:h", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'i':
 			if (parse_interval(optarg, &interval) < 0) {
@@ -322,7 +442,10 @@ int main(int argc, char **argv)
 			path = optarg;
 			break;
 		case 'm':
-			moisture = optarg;
+			cs.prog = optarg;
+			break;
+		case OPT_NO_RESTART:
+			cs.restart = 0;
 			break;
 		case 'h':
 			usage(stdout, argv[0]);
@@ -337,9 +460,12 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	/* Take SIGTERM/SIGINT through a signalfd so shutdown can't race poll(). */
+	/*
+	 * Take SIGTERM/SIGINT/SIGCHLD through a signalfd so shutdown and child
+	 * death can't race poll(). They must be blocked before the first fork.
+	 */
 	if (sigemptyset(&mask) < 0 || sigaddset(&mask, SIGTERM) < 0 ||
-	    sigaddset(&mask, SIGINT) < 0) {
+	    sigaddset(&mask, SIGINT) < 0 || sigaddset(&mask, SIGCHLD) < 0) {
 		log_msg(L_ERROR, "light", "sigset setup failed (errno=%d)", errno);
 		goto out;
 	}
@@ -354,12 +480,20 @@ int main(int argc, char **argv)
 	}
 
 	/* Fork before opening the ring, timers and bus so the child inherits none. */
-	child = start_child(moisture, interval, &mask);
-	if (child < 0)
+	cs.interval = interval;
+	cs.mask = &mask;
+	spawn_child(&cs);
+	if (cs.pid < 0)
 		goto out;
 
 	if (ring_open(path, &ring) < 0)
 		goto out;
+	restart_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+	if (restart_fd < 0) {
+		log_msg(L_ERROR, "parent", "timerfd_create restart failed (errno=%d)",
+			errno);
+		goto out;
+	}
 	tick_fd = make_timer(interval, "read");
 	if (tick_fd < 0)
 		goto out;
@@ -372,20 +506,21 @@ int main(int argc, char **argv)
 	take_reading(ring, &bus, &st);
 
 	for (;;) {
-		struct pollfd pfd[3] = {
+		struct pollfd pfd[4] = {
 			{ .fd = sig_fd, .events = POLLIN },
 			{ .fd = tick_fd, .events = POLLIN },
 			{ .fd = hb_fd, .events = POLLIN },
+			{ .fd = restart_fd, .events = POLLIN },
 		};
 		uint64_t exp;
 
-		if (poll(pfd, 3, -1) < 0) {
+		if (poll(pfd, 4, -1) < 0) {
 			if (errno == EINTR)
 				continue;
 			log_msg(L_ERROR, "light", "poll failed (errno=%d)", errno);
 			goto out;
 		}
-		for (int i = 0; i < 3; i++) {
+		for (int i = 0; i < 4; i++) {
 			if (pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
 				log_msg(L_ERROR, "light", "poll fd %d revents 0x%x",
 					pfd[i].fd, (unsigned)pfd[i].revents);
@@ -401,10 +536,15 @@ int main(int argc, char **argv)
 					n, n < 0 ? errno : 0);
 				goto out;
 			}
-			log_msg(L_INFO, "light", "signal %u, exiting",
-				(unsigned)si.ssi_signo);
-			ret = 0;
-			goto out;
+			if (si.ssi_signo == SIGCHLD) {
+				if (on_sigchld(&cs, restart_fd) < 0)
+					goto out;
+			} else {
+				log_msg(L_INFO, "light", "signal %u, exiting",
+					(unsigned)si.ssi_signo);
+				ret = 0;
+				goto out;
+			}
 		}
 		if (pfd[1].revents & POLLIN) {
 			if (read_timer(tick_fd, "read", &exp) < 0)
@@ -421,10 +561,17 @@ int main(int argc, char **argv)
 				"heartbeat: readings=%lu faults=%lu store_errors=%lu",
 				st.readings, st.faults, st.store_errors);
 		}
+		if (pfd[3].revents & POLLIN) {
+			if (read_timer(restart_fd, "restart", &exp) < 0)
+				goto out;
+			if (on_restart_timer(&cs, restart_fd) < 0)
+				goto out;
+		}
 	}
 
 out:
-	stop_child(child);
+	stop_child(cs.pid);
+	close_fd(&restart_fd, "restart timer");
 	close_fd(&hb_fd, "heartbeat timer");
 	close_fd(&tick_fd, "read timer");
 	close_fd(&bus, GPIO_CHIP);
