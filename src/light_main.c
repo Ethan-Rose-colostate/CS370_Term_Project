@@ -44,6 +44,13 @@
 #endif
 #define DEFAULT_RING		"data/light.ring"
 #define DEFAULT_MOISTURE	"build/moisture"
+/* Daytime read window [DAY_START_H, DAY_END_H), local time; overridable for tests. */
+#ifndef DAY_START_H
+#define DAY_START_H		8
+#endif
+#ifndef DAY_END_H
+#define DAY_END_H		18
+#endif
 #define BACKOFF_MAX_S		60
 #define BACKOFF_RESET_S		600	/* child uptime that resets the backoff */
 
@@ -53,6 +60,11 @@ struct stats {
 	unsigned long readings;
 	unsigned long faults;
 	unsigned long store_errors;
+};
+
+/* Light decision state carried between readings. */
+struct light_state {
+	int paused;		/* outside the daytime window */
 };
 
 /* The moisture child and its restart policy. */
@@ -206,6 +218,37 @@ static void take_reading(struct ring *ring, int *bus, struct stats *st)
 		return;
 	}
 	log_msg(L_INFO, "light", "bright=%u fault=%u", (unsigned)lux, (unsigned)fault);
+}
+
+/* Local hour 0..23, or -1 if the clock can't be read. */
+static int local_hour(void)
+{
+	time_t now = time(NULL);
+	struct tm tm;
+
+	if (now == (time_t)-1 || !localtime_r(&now, &tm)) {
+		log_msg(L_WARN, "light", "local time unavailable (errno=%d)", errno);
+		return -1;
+	}
+	return tm.tm_hour;
+}
+
+/*
+ * True if a reading should be taken now. If the clock can't be read, read
+ * anyway: a stray night reading beats a lost day of data.
+ */
+static int daytime(struct light_state *ls)
+{
+	int h = local_hour();
+	int in = h < 0 || (h >= DAY_START_H && h < DAY_END_H);
+
+	if (ls->paused == in) {
+		ls->paused = !in;
+		log_msg(L_INFO, "light", "%s %02d:00-%02d:00, readings %s",
+			in ? "inside" : "outside", DAY_START_H, DAY_END_H,
+			in ? "resumed" : "paused");
+	}
+	return in;
 }
 
 static int make_timer(long secs, const char *what)
@@ -472,6 +515,7 @@ int main(int argc, char **argv)
 	long interval = DEFAULT_INTERVAL_S;
 	struct ring *ring = NULL;
 	struct stats st = { 0 };
+	struct light_state ls = { 0 };
 	struct child_sup cs = {
 		.prog = DEFAULT_MOISTURE, .restart = 1, .pid = -1,
 		.started = -1, .delay_s = 1,
@@ -555,7 +599,8 @@ int main(int argc, char **argv)
 
 	log_msg(L_INFO, "light", "heartbeat: started, interval %lds, ring %s",
 		interval, path);
-	take_reading(ring, &bus, &st);
+	if (daytime(&ls))
+		take_reading(ring, &bus, &st);
 
 	for (;;) {
 		struct pollfd pfd[4] = {
@@ -604,7 +649,8 @@ int main(int argc, char **argv)
 			if (exp > 1)
 				log_msg(L_WARN, "light", "missed %llu read ticks",
 					(unsigned long long)(exp - 1));
-			take_reading(ring, &bus, &st);
+			if (daytime(&ls))
+				take_reading(ring, &bus, &st);
 		}
 		if (pfd[2].revents & POLLIN) {
 			if (read_timer(hb_fd, "heartbeat", &exp) < 0)
