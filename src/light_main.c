@@ -39,7 +39,9 @@
 #define READ_ATTEMPTS		3
 #define RETRY_MS		100
 #define DEFAULT_INTERVAL_S	1200
+#ifndef HEARTBEAT_S			/* overridable for tests: -DHEARTBEAT_S=10 */
 #define HEARTBEAT_S		3600
+#endif
 #define DEFAULT_RING		"data/light.ring"
 #define DEFAULT_MOISTURE	"build/moisture"
 #define BACKOFF_MAX_S		60
@@ -410,6 +412,56 @@ static int on_restart_timer(struct child_sup *cs, int restart_fd)
 	return 0;
 }
 
+/* VmRSS of pid from /proc/<pid>/status. Returns -1 if unavailable (zombie). */
+static int read_rss_kb(pid_t pid, unsigned long *kb)
+{
+	char path[64], line[128];
+	int found = -1;
+	FILE *f;
+	int n;
+
+	n = snprintf(path, sizeof path, "/proc/%ld/status", (long)pid);
+	if (n < 0 || (size_t)n >= sizeof path) {
+		log_msg(L_WARN, "parent", "status path format failed");
+		return -1;
+	}
+	f = fopen(path, "r");
+	if (!f) {
+		log_msg(L_WARN, "parent", "open %s failed (errno=%d)", path, errno);
+		return -1;
+	}
+	while (fgets(line, sizeof line, f)) {
+		if (sscanf(line, "VmRSS: %lu kB", kb) == 1) {
+			found = 0;
+			break;
+		}
+	}
+	if (found < 0 && ferror(f))
+		log_msg(L_WARN, "parent", "read %s failed (errno=%d)", path, errno);
+	if (fclose(f) == EOF)
+		log_msg(L_WARN, "parent", "close %s failed (errno=%d)", path, errno);
+	return found;
+}
+
+static void heartbeat(const struct child_sup *cs, const struct stats *st)
+{
+	char prss[24] = "n/a", crss[24] = "n/a", alive[32] = "down";
+	unsigned long kb;
+
+	if (read_rss_kb(getpid(), &kb) == 0)
+		snprintf(prss, sizeof prss, "%lu", kb);
+	if (cs->pid > 0) {
+		snprintf(alive, sizeof alive, "pid %ld alive", (long)cs->pid);
+		if (read_rss_kb(cs->pid, &kb) == 0)
+			snprintf(crss, sizeof crss, "%lu", kb);
+	}
+	log_msg(L_INFO, "parent",
+		"heartbeat: child %s, rss parent=%s kB child=%s kB, "
+		"light readings=%lu faults=%lu store_errors=%lu, restarts=%lu",
+		alive, prss, crss, st->readings, st->faults, st->store_errors,
+		cs->restarts);
+}
+
 int main(int argc, char **argv)
 {
 	static const struct option longopts[] = {
@@ -557,9 +609,7 @@ int main(int argc, char **argv)
 		if (pfd[2].revents & POLLIN) {
 			if (read_timer(hb_fd, "heartbeat", &exp) < 0)
 				goto out;
-			log_msg(L_INFO, "light",
-				"heartbeat: readings=%lu faults=%lu store_errors=%lu",
-				st.readings, st.faults, st.store_errors);
+			heartbeat(&cs, &st);
 		}
 		if (pfd[3].revents & POLLIN) {
 			if (read_timer(restart_fd, "restart", &exp) < 0)
